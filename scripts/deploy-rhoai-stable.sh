@@ -172,7 +172,7 @@ fi
 
 # Set defaults for any unset variables
 : "${OPERATOR_TYPE:=odh}"
-: "${MAAS_REF:=main}"
+: "${MAAS_REF:=v0.0.2}"
 # CERT_NAME will be detected dynamically later, but can be overridden via env var or CLI arg
 
 # Validate OPERATOR_TYPE
