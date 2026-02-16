@@ -19,6 +19,7 @@ package maas
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/go-logr/logr"
@@ -91,164 +92,140 @@ func (r *MaaSSubscriptionReconciler) Reconcile(ctx context.Context, req ctrl.Req
 }
 
 func (r *MaaSSubscriptionReconciler) reconcileTokenRateLimitPolicies(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription) error {
-	// Create one TokenRateLimitPolicy per model in the subscription
-	// Each policy targets the HTTPRoute for that specific model
+	// Model-centric approach: for each model referenced by this subscription,
+	// find ALL subscriptions for that model and build a single aggregated TRLP.
+	// Kuadrant only allows one TokenRateLimitPolicy per HTTPRoute target.
 	for _, modelRef := range subscription.Spec.ModelRefs {
-		// Find the MaaSModel to determine HTTPRoute name and namespace
 		httpRouteName, httpRouteNS, err := r.findHTTPRouteForModel(ctx, log, subscription.Namespace, modelRef.Name)
 		if err != nil {
 			if strings.Contains(err.Error(), "not found") {
-				// Model or HTTPRoute genuinely not found (deleted) — skip and clean up
-				log.Info("model not found, cleaning up generated policy", "model", modelRef.Name)
-				r.deleteGeneratedTRLPForModel(ctx, log, subscription, modelRef.Name)
+				log.Info("model not found, cleaning up generated TRLP", "model", modelRef.Name)
+				r.deleteModelTRLP(ctx, log, modelRef.Name)
 				continue
 			}
-			// Transient error (API timeout, RBAC, etc.) — don't delete, requeue
 			return fmt.Errorf("failed to resolve HTTPRoute for model %s: %w", modelRef.Name, err)
 		}
 
-		policyName := fmt.Sprintf("subscription-%s-model-%s", subscription.Name, modelRef.Name)
-
-		// Use unstructured for TokenRateLimitPolicy since Go types may not be available
-		policy := &unstructured.Unstructured{}
-		policy.SetGroupVersionKind(schema.GroupVersionKind{
-			Group:   "kuadrant.io",
-			Version: "v1alpha1",
-			Kind:    "TokenRateLimitPolicy",
-		})
-		policy.SetName(policyName)
-		// Use the same namespace as the HTTPRoute
-		policy.SetNamespace(httpRouteNS)
-
-		// Set labels to link TokenRateLimitPolicy to Subscription
-		// This helps OpenShift UI show the relationship in "resource of" tab
-		labels := map[string]string{
-			"maas.opendatahub.io/subscription":    subscription.Name,
-			"maas.opendatahub.io/subscription-ns": subscription.Namespace,
-			"maas.opendatahub.io/model":           modelRef.Name,
-			"app.kubernetes.io/managed-by":        "maas-controller",
-			"app.kubernetes.io/part-of":           "maas-subscription",
-			"app.kubernetes.io/component":         "token-rate-limit-policy",
+		// Find ALL subscriptions for this model (not just the current one)
+		allSubs, err := findAllSubscriptionsForModel(ctx, r.Client, modelRef.Name)
+		if err != nil {
+			return fmt.Errorf("failed to list subscriptions for model %s: %w", modelRef.Name, err)
 		}
-		policy.SetLabels(labels)
-
-		// Set owner reference (only if in same namespace - Kubernetes doesn't allow cross-namespace owner references)
-		// For cross-namespace, labels above will help OpenShift UI show the relationship in "resource of" tab
-		if httpRouteNS == subscription.Namespace {
-			if err := controllerutil.SetControllerReference(subscription, policy, r.Scheme); err != nil {
-				return fmt.Errorf("failed to set controller reference: %w", err)
-			}
-		}
-		// Note: For cross-namespace resources, we rely on labels to establish the relationship
-		// OpenShift UI can use these labels to show TokenRateLimitPolicy in the Subscription's "resource of" tab
-
-		// Build limits from subscription spec (structure matches example-tokenratepolicy.yaml)
-		limitKey := fmt.Sprintf("%s-%s-tokens", subscription.Name, modelRef.Name)
-
-		// Convert token rate limits to []interface{}; use default rate if none specified
-		var rates []interface{}
-		if len(modelRef.TokenRateLimits) > 0 {
-			for _, trl := range modelRef.TokenRateLimits {
-				rates = append(rates, map[string]interface{}{
-					"limit":  trl.Limit,
-					"window": trl.Window,
-				})
-			}
-		} else {
-			rates = append(rates, map[string]interface{}{
-				"limit":  int64(100),
-				"window": "1m",
-			})
-		}
-
-		// Build predicate so the limit applies and 429s can occur:
-		// - Exclude /v1/models (list models) from counting toward the limit.
-		// - When subscription has Owner (groups/users): apply limit when user is in one of those groups
-		//   or is one of those users. Use auth.identity.user.groups (TokenReview) and optionally
-		//   auth.identity.groups if set by AuthPolicy response. Do not require X-MAAS-HEADER so
-		//   curl with Bearer token alone can trigger the limit.
-		// - When no owner: require X-MAAS-HEADER so only requests with that header are limited.
 
 		pathCheck := `!request.path.endsWith("/v1/models")`
+		limitsMap := map[string]interface{}{}
+		var allOwnerChecks []string
+		var subNames []string
 
-		var groupChecks []string
-		for _, group := range subscription.Spec.Owner.Groups {
-			// Use comma-separated groups_str from AuthPolicy response: auth.identity.groups_str.split(",").exists(g, g == "group")
-			groupChecks = append(groupChecks, fmt.Sprintf(`auth.identity.groups_str.split(",").exists(g, g == "%s")`, group.Name))
+		// Collect per-subscription info: owner checks and max limit (for priority sorting).
+		type subInfo struct {
+			sub         maasv1alpha1.MaaSSubscription
+			mRef        maasv1alpha1.ModelSubscriptionRef
+			ownerChecks []string
+			rates       []interface{}
+			maxLimit    int64
 		}
-
-		var userChecks []string
-		for _, user := range subscription.Spec.Owner.Users {
-			userChecks = append(userChecks, fmt.Sprintf(`auth.identity.user.username == "%s"`, user))
-		}
-
-		var ownerChecks []string
-		ownerChecks = append(ownerChecks, groupChecks...)
-		ownerChecks = append(ownerChecks, userChecks...)
-
-		var predicate string
-		if len(ownerChecks) > 0 {
-			ownerPredicate := "(" + ownerChecks[0]
-			for i := 1; i < len(ownerChecks); i++ {
-				ownerPredicate += " || " + ownerChecks[i]
-			}
-			ownerPredicate += ")"
-			// Apply limit when path is not /v1/models and user matches owner (no header required).
-			predicate = pathCheck + " && " + ownerPredicate
-		} else {
-			// No owner: require X-MAAS-HEADER so only subscription-scoped requests are limited.
-			subscriptionIDCheck := fmt.Sprintf(`request.http.headers["X-MAAS-HEADER"] == "%s"`, subscription.Name)
-			predicate = pathCheck + " && " + subscriptionIDCheck
-		}
-
-		// Build the limits map with the subscription's rate limit rule
-		limitsMap := map[string]interface{}{
-			limitKey: map[string]interface{}{
-				"rates": rates,
-				"when": []interface{}{
-					map[string]interface{}{
-						"predicate": predicate,
-					},
-				},
-				"counters": []interface{}{
-					map[string]interface{}{
-						"expression": "auth.identity.userid",
-					},
-				},
-			},
-		}
-
-		// Add deny-unsubscribed catch-all rule.
-		// When a per-route TRLP exists, it completely overrides the gateway-level
-		// default-deny (Kuadrant atomic defaults strategy). Without this catch-all,
-		// users who don't match the subscription's group/user predicates would get
-		// NO rate limit at all (effectively unlimited access).
-		// This rule ensures those users still get 429 (0 tokens).
-		if len(ownerChecks) > 0 {
-			denyOwnerPredicate := "!(" + strings.Join(ownerChecks, " || ") + ")"
-			denyPredicate := pathCheck + " && " + denyOwnerPredicate
-			denyLimitKey := fmt.Sprintf("%s-%s-deny-unsubscribed", subscription.Name, modelRef.Name)
-			limitsMap[denyLimitKey] = map[string]interface{}{
-				"rates": []interface{}{
-					map[string]interface{}{
-						"limit":  int64(0),
-						"window": "1m",
-					},
-				},
-				"when": []interface{}{
-					map[string]interface{}{
-						"predicate": denyPredicate,
-					},
-				},
-				"counters": []interface{}{
-					map[string]interface{}{
-						"expression": "auth.identity.userid",
-					},
-				},
+		var subs []subInfo
+		for _, sub := range allSubs {
+			for _, mRef := range sub.Spec.ModelRefs {
+				if mRef.Name != modelRef.Name {
+					continue
+				}
+				var ownerChecks []string
+				for _, group := range sub.Spec.Owner.Groups {
+					if err := validateCELValue(group.Name, "group name"); err != nil {
+						return fmt.Errorf("invalid owner in MaaSSubscription %s: %w", sub.Name, err)
+					}
+					ownerChecks = append(ownerChecks, fmt.Sprintf(`auth.identity.groups_str.split(",").exists(g, g == "%s")`, group.Name))
+				}
+				for _, user := range sub.Spec.Owner.Users {
+					if err := validateCELValue(user, "username"); err != nil {
+						return fmt.Errorf("invalid owner in MaaSSubscription %s: %w", sub.Name, err)
+					}
+					ownerChecks = append(ownerChecks, fmt.Sprintf(`auth.identity.user.username == "%s"`, user))
+				}
+				var rates []interface{}
+				var maxLimit int64
+				if len(mRef.TokenRateLimits) > 0 {
+					for _, trl := range mRef.TokenRateLimits {
+						rates = append(rates, map[string]interface{}{"limit": trl.Limit, "window": trl.Window})
+						if trl.Limit > maxLimit {
+							maxLimit = trl.Limit
+						}
+					}
+				} else {
+					rates = append(rates, map[string]interface{}{"limit": int64(100), "window": "1m"})
+					maxLimit = 100
+				}
+				subs = append(subs, subInfo{sub: sub, mRef: mRef, ownerChecks: ownerChecks, rates: rates, maxLimit: maxLimit})
+				break
 			}
 		}
 
-		// Build the spec - target the HTTPRoute
+		// Sort subscriptions by maxLimit descending (highest tier first).
+		// This determines priority: higher-limit subscriptions take precedence.
+		sort.Slice(subs, func(i, j int) bool { return subs[i].maxLimit > subs[j].maxLimit })
+
+		// Build limits with mutually exclusive predicates.
+		// Each subscription's predicate includes "AND NOT in any higher-tier group" so that
+		// a user matching multiple subscriptions only hits the highest-limit one.
+		for i, si := range subs {
+			subNames = append(subNames, si.sub.Name)
+			allOwnerChecks = append(allOwnerChecks, si.ownerChecks...)
+
+			var predicate string
+			if len(si.ownerChecks) > 0 {
+				// Collect exclusions: all owner checks from higher-priority (earlier) subscriptions
+				var exclusions []string
+				for j := 0; j < i; j++ {
+					exclusions = append(exclusions, subs[j].ownerChecks...)
+				}
+				ownerPart := "(" + strings.Join(si.ownerChecks, " || ") + ")"
+				if len(exclusions) > 0 {
+					ownerPart += " && !(" + strings.Join(exclusions, " || ") + ")"
+				}
+				predicate = pathCheck + " && " + ownerPart
+			} else {
+				subscriptionIDCheck := fmt.Sprintf(`request.headers["x-maas-subscription"] == "%s"`, si.sub.Name)
+				predicate = pathCheck + " && " + subscriptionIDCheck
+			}
+
+			limitKey := fmt.Sprintf("%s-%s-tokens", si.sub.Name, si.mRef.Name)
+			limitsMap[limitKey] = map[string]interface{}{
+				"rates": si.rates,
+				"when":  []interface{}{map[string]interface{}{"predicate": predicate}},
+				"counters": []interface{}{
+					map[string]interface{}{"expression": "auth.identity.userid"},
+				},
+			}
+		}
+
+		// Add unified deny-unsubscribed catch-all from ALL subscriptions' owner checks
+		if len(allOwnerChecks) > 0 {
+			denyPredicate := pathCheck + " && !(" + strings.Join(allOwnerChecks, " || ") + ")"
+			limitsMap[fmt.Sprintf("deny-unsubscribed-%s", modelRef.Name)] = map[string]interface{}{
+				"rates":    []interface{}{map[string]interface{}{"limit": int64(0), "window": "1m"}},
+				"when":     []interface{}{map[string]interface{}{"predicate": denyPredicate}},
+				"counters": []interface{}{map[string]interface{}{"expression": "auth.identity.userid"}},
+			}
+		}
+
+		// Build the aggregated TRLP (one per model, covering all subscriptions)
+		policyName := fmt.Sprintf("maas-trlp-%s", modelRef.Name)
+		policy := &unstructured.Unstructured{}
+		policy.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicy"})
+		policy.SetName(policyName)
+		policy.SetNamespace(httpRouteNS)
+		policy.SetLabels(map[string]string{
+			"maas.opendatahub.io/model":    modelRef.Name,
+			"app.kubernetes.io/managed-by": "maas-controller",
+			"app.kubernetes.io/part-of":    "maas-subscription",
+			"app.kubernetes.io/component":  "token-rate-limit-policy",
+		})
+		policy.SetAnnotations(map[string]string{
+			"maas.opendatahub.io/subscriptions": strings.Join(subNames, ","),
+		})
+
 		spec := map[string]interface{}{
 			"targetRef": map[string]interface{}{
 				"group": "gateway.networking.k8s.io",
@@ -257,45 +234,25 @@ func (r *MaaSSubscriptionReconciler) reconcileTokenRateLimitPolicies(ctx context
 			},
 			"limits": limitsMap,
 		}
-
 		if err := unstructured.SetNestedMap(policy.Object, spec, "spec"); err != nil {
 			return fmt.Errorf("failed to set spec: %w", err)
 		}
 
-		// Add billing metadata as annotations
-		if subscription.Spec.BillingMetadata != nil {
-			annotations := make(map[string]string)
-			if subscription.Spec.BillingMetadata.OrganizationID != "" {
-				annotations["maas.opendatahub.io/organization-id"] = subscription.Spec.BillingMetadata.OrganizationID
-			}
-			if subscription.Spec.BillingMetadata.CostCenter != "" {
-				annotations["maas.opendatahub.io/cost-center"] = subscription.Spec.BillingMetadata.CostCenter
-			}
-			for k, v := range subscription.Spec.BillingMetadata.Labels {
-				annotations[fmt.Sprintf("maas.opendatahub.io/label/%s", k)] = v
-			}
-			policy.SetAnnotations(annotations)
-		}
-
-		// Create or update the policy
+		// Create or update
 		existing := &unstructured.Unstructured{}
 		existing.SetGroupVersionKind(policy.GroupVersionKind())
-		key := client.ObjectKeyFromObject(policy)
-
-		err = r.Get(ctx, key, existing)
+		err = r.Get(ctx, client.ObjectKeyFromObject(policy), existing)
 		if apierrors.IsNotFound(err) {
 			if err := r.Create(ctx, policy); err != nil {
-				return fmt.Errorf("failed to create TokenRateLimitPolicy for model %s: %w", modelRef.Name, err)
+				return fmt.Errorf("failed to create TRLP for model %s: %w", modelRef.Name, err)
 			}
-			log.Info("TokenRateLimitPolicy created", "name", policyName, "model", modelRef.Name, "httpRoute", httpRouteName, "namespace", httpRouteNS)
+			log.Info("TokenRateLimitPolicy created", "name", policyName, "model", modelRef.Name, "subscriptions", subNames)
 		} else if err != nil {
-			return fmt.Errorf("failed to get existing TokenRateLimitPolicy: %w", err)
+			return fmt.Errorf("failed to get existing TRLP: %w", err)
 		} else {
-			// Skip update if the generated policy has opted out of management
 			if existing.GetAnnotations()["maas.opendatahub.io/managed"] == "false" {
-				log.Info("TokenRateLimitPolicy has maas.opendatahub.io/managed=false, skipping update", "name", policyName, "model", modelRef.Name)
+				log.Info("TokenRateLimitPolicy opted out, skipping", "name", policyName)
 			} else {
-				// Merge annotations to preserve existing ones (e.g. from Kuadrant or user)
 				mergedAnnotations := existing.GetAnnotations()
 				if mergedAnnotations == nil {
 					mergedAnnotations = make(map[string]string)
@@ -305,166 +262,56 @@ func (r *MaaSSubscriptionReconciler) reconcileTokenRateLimitPolicies(ctx context
 				}
 				existing.SetAnnotations(mergedAnnotations)
 				existing.SetLabels(policy.GetLabels())
-				// Update owner references if in same namespace
-				if httpRouteNS == subscription.Namespace {
-					if err := controllerutil.SetControllerReference(subscription, existing, r.Scheme); err != nil {
-						return fmt.Errorf("failed to update controller reference: %w", err)
-					}
-				}
 				if err := unstructured.SetNestedMap(existing.Object, spec, "spec"); err != nil {
 					return fmt.Errorf("failed to update spec: %w", err)
 				}
 				if err := r.Update(ctx, existing); err != nil {
-					return fmt.Errorf("failed to update TokenRateLimitPolicy for model %s: %w", modelRef.Name, err)
+					return fmt.Errorf("failed to update TRLP for model %s: %w", modelRef.Name, err)
 				}
-				log.Info("TokenRateLimitPolicy updated", "name", policyName, "model", modelRef.Name, "httpRoute", httpRouteName, "namespace", httpRouteNS)
+				log.Info("TokenRateLimitPolicy updated", "name", policyName, "model", modelRef.Name, "subscriptions", subNames)
 			}
 		}
 	}
-
 	return nil
 }
 
-// deleteGeneratedTRLPForModel deletes the generated TokenRateLimitPolicy for a specific model
-// that no longer exists (e.g. MaaSModel was deleted).
-func (r *MaaSSubscriptionReconciler) deleteGeneratedTRLPForModel(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription, modelName string) {
+// deleteModelTRLP deletes the aggregated TRLP for a model by label.
+func (r *MaaSSubscriptionReconciler) deleteModelTRLP(ctx context.Context, log logr.Logger, modelName string) {
 	policyList := &unstructured.UnstructuredList{}
 	policyList.SetGroupVersionKind(schema.GroupVersionKind{Group: "kuadrant.io", Version: "v1alpha1", Kind: "TokenRateLimitPolicyList"})
 	labelSelector := client.MatchingLabels{
-		"maas.opendatahub.io/model":        modelName,
-		"maas.opendatahub.io/subscription": subscription.Name,
-		"app.kubernetes.io/managed-by":     "maas-controller",
+		"maas.opendatahub.io/model":    modelName,
+		"app.kubernetes.io/managed-by": "maas-controller",
+		"app.kubernetes.io/part-of":    "maas-subscription",
 	}
 	if err := r.List(ctx, policyList, labelSelector); err != nil {
-		log.Error(err, "failed to list TokenRateLimitPolicies for cleanup", "model", modelName)
+		log.Error(err, "failed to list TRLPs for cleanup", "model", modelName)
 		return
 	}
 	for i := range policyList.Items {
 		p := &policyList.Items[i]
-		log.Info("Deleting orphaned TokenRateLimitPolicy for deleted model", "name", p.GetName(), "namespace", p.GetNamespace(), "model", modelName)
+		log.Info("Deleting TRLP", "name", p.GetName(), "namespace", p.GetNamespace(), "model", modelName)
 		if err := r.Delete(ctx, p); err != nil && !apierrors.IsNotFound(err) {
-			log.Error(err, "failed to delete orphaned TokenRateLimitPolicy", "name", p.GetName())
+			log.Error(err, "failed to delete TRLP", "name", p.GetName())
 		}
 	}
 }
 
-// findHTTPRouteForModel finds the HTTPRoute for a given model name
-// It searches for MaaSModel resources and determines the HTTPRoute name based on the model kind
+// findHTTPRouteForModel delegates to the shared helper in helpers.go.
 func (r *MaaSSubscriptionReconciler) findHTTPRouteForModel(ctx context.Context, log logr.Logger, defaultNS, modelName string) (string, string, error) {
-	// List all MaaSModels and find the one with matching name
-	maasModelList := &maasv1alpha1.MaaSModelList{}
-	if err := r.List(ctx, maasModelList); err != nil {
-		return "", "", fmt.Errorf("failed to list MaaSModels: %w", err)
-	}
-
-	// Find matching MaaSModel (try defaultNS first, then any namespace)
-	var maasModel *maasv1alpha1.MaaSModel
-	for i := range maasModelList.Items {
-		if maasModelList.Items[i].Name == modelName {
-			// Skip models that are being deleted
-			if !maasModelList.Items[i].GetDeletionTimestamp().IsZero() {
-				continue
-			}
-			// Prefer the one in defaultNS if it exists
-			if maasModelList.Items[i].Namespace == defaultNS {
-				maasModel = &maasModelList.Items[i]
-				break
-			}
-			// Otherwise, use the first match
-			if maasModel == nil {
-				maasModel = &maasModelList.Items[i]
-			}
-		}
-	}
-
-	if maasModel == nil {
-		return "", "", fmt.Errorf("MaaSModel %s not found", modelName)
-	}
-
-	// Determine HTTPRoute name and namespace based on model kind
-	var httpRouteName string
-	// For HTTPRoute namespace, use ModelRef.Namespace if specified, otherwise use the namespace where the model resource exists
-	// For llmisvc, the HTTPRoute is in the same namespace as the LLMInferenceService
-	httpRouteNS := maasModel.Namespace
-	if maasModel.Spec.ModelRef.Namespace != "" {
-		httpRouteNS = maasModel.Spec.ModelRef.Namespace
-	}
-
-	switch maasModel.Spec.ModelRef.Kind {
-	case "llmisvc":
-		// For llmisvc, find HTTPRoute using labels
-		// The HTTPRoute is in the same namespace as the LLMInferenceService
-		// Use ModelRef.Namespace if specified, otherwise use the namespace where the LLMInferenceService exists
-		llmisvcNS := maasModel.Namespace
-		if maasModel.Spec.ModelRef.Namespace != "" {
-			llmisvcNS = maasModel.Spec.ModelRef.Namespace
-		}
-
-		routeList := &gatewayapiv1.HTTPRouteList{}
-		labelSelector := client.MatchingLabels{
-			"app.kubernetes.io/name":      maasModel.Spec.ModelRef.Name,
-			"app.kubernetes.io/component": "llminferenceservice-router",
-			"app.kubernetes.io/part-of":   "llminferenceservice",
-		}
-
-		if err := r.List(ctx, routeList, client.InNamespace(llmisvcNS), labelSelector); err != nil {
-			return "", "", fmt.Errorf("failed to list HTTPRoutes for LLMInferenceService %s: %w", maasModel.Spec.ModelRef.Name, err)
-		}
-
-		if len(routeList.Items) == 0 {
-			return "", "", fmt.Errorf("HTTPRoute not found for LLMInferenceService %s in namespace %s", maasModel.Spec.ModelRef.Name, llmisvcNS)
-		}
-
-		httpRouteName = routeList.Items[0].Name
-		// HTTPRoute namespace is where we actually found it (use the HTTPRoute's namespace)
-		httpRouteNS = routeList.Items[0].Namespace
-	case "ExternalModel":
-		// For ExternalModel, use the MaaSModel HTTPRoute naming convention
-		httpRouteName = fmt.Sprintf("maas-model-%s", maasModel.Name)
-	default:
-		return "", "", fmt.Errorf("unknown model kind: %s", maasModel.Spec.ModelRef.Kind)
-	}
-
-	// Verify the HTTPRoute exists
-	httpRoute := &gatewayapiv1.HTTPRoute{}
-	key := client.ObjectKey{
-		Name:      httpRouteName,
-		Namespace: httpRouteNS,
-	}
-	if err := r.Get(ctx, key, httpRoute); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", "", fmt.Errorf("HTTPRoute %s/%s not found for model %s", httpRouteNS, httpRouteName, modelName)
-		}
-		return "", "", fmt.Errorf("failed to get HTTPRoute %s/%s: %w", httpRouteNS, httpRouteName, err)
-	}
-
-	return httpRouteName, httpRouteNS, nil
+	return findHTTPRouteForModel(ctx, r.Client, defaultNS, modelName)
 }
 
 func (r *MaaSSubscriptionReconciler) handleDeletion(ctx context.Context, log logr.Logger, subscription *maasv1alpha1.MaaSSubscription) (ctrl.Result, error) {
 	if controllerutil.ContainsFinalizer(subscription, maasSubscriptionFinalizer) {
-		// Clean up all TokenRateLimitPolicies for this subscription
+		// For each model referenced by this subscription, delete the aggregated TRLP.
+		// The TRLP deletion event triggers the watch (mapGeneratedTRLPToParent), which
+		// finds another subscription for the same model and re-reconciles it. That
+		// reconcile rebuilds the TRLP from remaining subscriptions.
+		// If no other subscriptions exist, the model falls back to gateway-default-deny.
 		for _, modelRef := range subscription.Spec.ModelRefs {
-			_, httpRouteNS, err := r.findHTTPRouteForModel(ctx, log, subscription.Namespace, modelRef.Name)
-			if err != nil {
-				log.Info("failed to find HTTPRoute for model during deletion, trying subscription namespace", "model", modelRef.Name, "error", err)
-				httpRouteNS = subscription.Namespace
-			}
-
-			policyName := fmt.Sprintf("subscription-%s-model-%s", subscription.Name, modelRef.Name)
-			policy := &unstructured.Unstructured{}
-			policy.SetGroupVersionKind(schema.GroupVersionKind{
-				Group:   "kuadrant.io",
-				Version: "v1alpha1",
-				Kind:    "TokenRateLimitPolicy",
-			})
-			policy.SetName(policyName)
-			policy.SetNamespace(httpRouteNS)
-
-			if err := r.Delete(ctx, policy); err != nil && !apierrors.IsNotFound(err) {
-				log.Error(err, "failed to delete TokenRateLimitPolicy", "name", policyName, "namespace", httpRouteNS)
-				return ctrl.Result{}, err
-			}
+			log.Info("Deleting model TRLP so remaining subscriptions can rebuild it", "model", modelRef.Name)
+			r.deleteModelTRLP(ctx, log, modelRef.Name)
 		}
 
 		controllerutil.RemoveFinalizer(subscription, maasSubscriptionFinalizer)
@@ -533,20 +380,24 @@ func (r *MaaSSubscriptionReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// mapGeneratedTRLPToParent maps a generated TokenRateLimitPolicy back to its parent
-// MaaSSubscription using the labels set at creation time.
-func (r *MaaSSubscriptionReconciler) mapGeneratedTRLPToParent(_ context.Context, obj client.Object) []reconcile.Request {
+// mapGeneratedTRLPToParent maps a generated TokenRateLimitPolicy back to any
+// MaaSSubscription that references the same model. The TRLP is per-model (aggregated),
+// so we use the model label to find a subscription to trigger reconciliation.
+func (r *MaaSSubscriptionReconciler) mapGeneratedTRLPToParent(ctx context.Context, obj client.Object) []reconcile.Request {
 	labels := obj.GetLabels()
 	if labels["app.kubernetes.io/managed-by"] != "maas-controller" {
-		return nil // not a generated policy
+		return nil
 	}
-	subName := labels["maas.opendatahub.io/subscription"]
-	subNS := labels["maas.opendatahub.io/subscription-ns"]
-	if subName == "" || subNS == "" {
+	modelName := labels["maas.opendatahub.io/model"]
+	if modelName == "" {
+		return nil
+	}
+	sub := findAnySubscriptionForModel(ctx, r.Client, modelName)
+	if sub == nil {
 		return nil
 	}
 	return []reconcile.Request{{
-		NamespacedName: types.NamespacedName{Name: subName, Namespace: subNS},
+		NamespacedName: types.NamespacedName{Name: sub.Name, Namespace: sub.Namespace},
 	}}
 }
 
@@ -589,7 +440,11 @@ func (r *MaaSSubscriptionReconciler) mapHTTPRouteToMaaSSubscriptions(ctx context
 	}
 	modelNamesInNS := map[string]bool{}
 	for _, m := range models.Items {
-		if m.Spec.ModelRef.Namespace == route.Namespace {
+		ns := m.Spec.ModelRef.Namespace
+		if ns == "" {
+			ns = m.Namespace
+		}
+		if ns == route.Namespace {
 			modelNamesInNS[m.Name] = true
 		}
 	}

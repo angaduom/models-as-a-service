@@ -72,16 +72,20 @@ Options:
   -t, --operator-type     Which operator to install: "odh" (default) or "rhoai"
   -r, --maas-ref          Git ref for MaaS manifests (default: main)
   -c, --cert-name         TLS certificate secret name (default: auto-detected)
+  -s, --enable-subscriptions  Install the MaaS subscription controller (per-model auth + rate limiting)
+                              Runs alongside existing tier-based flow. Does not replace it.
 
 Environment Variables:
   OPERATOR_TYPE           Same as --operator-type
   MAAS_REF                Same as --maas-ref
   CERT_NAME               Same as --cert-name
+  ENABLE_SUBSCRIPTIONS    Same as --enable-subscriptions (set to "true" to enable)
 
 Examples:
   $(basename "$0")                           # Install ODH (default)
   $(basename "$0") --operator-type rhoai     # Install RHOAI
   $(basename "$0") -t rhoai -r v1.0.0        # Install RHOAI with specific git ref
+  $(basename "$0") -s                         # Install ODH with subscription controller
   OPERATOR_TYPE=rhoai $(basename "$0")       # Install RHOAI via env var
 
 EOF
@@ -140,6 +144,10 @@ while [[ $# -gt 0 ]]; do
       CERT_NAME="$2"
       shift 2
       ;;
+    -s|--enable-subscriptions)
+      ENABLE_SUBSCRIPTIONS="true"
+      shift
+      ;;
     -b|--operator-catalog)
       OPERATOR_CATALOG="$2"
       shift 2
@@ -173,6 +181,7 @@ fi
 # Set defaults for any unset variables
 : "${OPERATOR_TYPE:=odh}"
 : "${MAAS_REF:=main}"
+: "${ENABLE_SUBSCRIPTIONS:=false}"
 # CERT_NAME will be detected dynamically later, but can be overridden via env var or CLI arg
 
 # Validate OPERATOR_TYPE
@@ -192,6 +201,9 @@ if [[ -n "${OPERATOR_CATALOG:-}" ]]; then
 fi
 if [[ -n "${OPERATOR_IMAGE:-}" ]]; then
   echo "Using custom operator image: ${OPERATOR_IMAGE}"
+fi
+if [[ "$ENABLE_SUBSCRIPTIONS" == "true" ]]; then
+  echo "Subscription controller: ENABLED (per-model auth + rate limiting)"
 fi
 echo "========================================="
 
@@ -679,6 +691,34 @@ echo "* Deploying rate-limit and token-limit policies..."
 kubectl apply --server-side=true \
   -f <(kustomize build "https://github.com/opendatahub-io/models-as-a-service.git/deployment/base/policies/usage-policies?ref=${MAAS_REF}")
 
+# ========================================
+# Subscription Controller (optional, additive)
+# ========================================
+# When enabled, installs the maas-controller alongside the existing tier-based flow.
+# The controller manages per-model auth and rate limiting via MaaSModel, MaaSAuthPolicy,
+# and MaaSSubscription CRDs. The old tier-based policies remain active for models that
+# don't have MaaS CRs — the two systems coexist without conflict.
+if [[ "$ENABLE_SUBSCRIPTIONS" == "true" ]]; then
+  echo
+  echo "## Installing MaaS Subscription Controller"
+
+  # Install the controller (CRDs + RBAC + deployment + gateway-default-deny TRLP)
+  echo "* Installing maas-controller (CRDs, RBAC, controller, default-deny policy)..."
+  "${SCRIPT_DIR}/../maas-controller/scripts/install-maas-controller.sh" "$APPLICATIONS_NS"
+
+  echo "* Waiting for maas-controller to be ready..."
+  kubectl rollout status deployment/maas-controller -n "$APPLICATIONS_NS" --timeout=120s 2>/dev/null || true
+
+  # Disable the old gateway-auth-policy so per-route AuthPolicies from the controller take effect.
+  # The old policy targets the entire gateway and conflicts with per-route auth.
+  # This is safe: the maas-api-auth-policy (for /maas-api/ and /v1/models) is NOT affected.
+  echo "* Disabling old gateway-auth-policy (replaced by per-route policies from maas-controller)..."
+  NAMESPACE="$APPLICATIONS_NS" "${SCRIPT_DIR}/../maas-controller/hack/disable-gateway-auth-policy.sh"
+
+  echo "* Subscription controller installed. Create MaaSModel, MaaSAuthPolicy, and"
+  echo "  MaaSSubscription resources to enable per-model auth and rate limiting."
+fi
+
 # Fix audience for ROSA/non-standard clusters
 # =====================================================
 # Background:
@@ -788,3 +828,31 @@ echo "9. Access Prometheus to view metrics:"
 echo "   kubectl port-forward -n openshift-monitoring svc/prometheus-k8s 9090:9091 &"
 echo "   # Open http://localhost:9090 in browser and search for: authorized_hits, authorized_calls, limited_calls"
 echo ""
+
+if [[ "$ENABLE_SUBSCRIPTIONS" == "true" ]]; then
+  echo "========================================="
+  echo "Subscription Controller — Additional Steps"
+  echo "========================================="
+  echo ""
+  echo "The MaaS subscription controller is installed. To use per-model auth and rate limiting:"
+  echo ""
+  echo "1. Register a model:"
+  echo "   kubectl apply -f maas-controller/examples/maas-model.yaml"
+  echo ""
+  echo "2. Create an auth policy (who can access):"
+  echo "   kubectl apply -f maas-controller/examples/maas-auth-policy.yaml"
+  echo ""
+  echo "3. Create a subscription (token rate limits):"
+  echo "   kubectl apply -f maas-controller/examples/maas-subscription.yaml"
+  echo ""
+  echo "4. Verify generated Kuadrant policies:"
+  echo "   kubectl get authpolicy,tokenratelimitpolicy --all-namespaces"
+  echo ""
+  echo "5. Check controller status:"
+  echo "   kubectl get maasmodel,maasauthpolicy,maassubscription -n ${APPLICATIONS_NS}"
+  echo ""
+  echo "NOTE: The old tier-based rate limits remain active for models without MaaS CRs."
+  echo "      Both systems coexist — the subscription controller only affects models that"
+  echo "      have MaaSModel + MaaSAuthPolicy + MaaSSubscription resources."
+  echo ""
+fi
