@@ -1,7 +1,7 @@
 # MaaS Controller Makefile
 # Build and deploy the MaaS control plane (MaaSModel, MaaSAuthPolicy, MaaSSubscription)
 
-.PHONY: build run test tidy install uninstall image-build image-push help
+.PHONY: build run test tidy install uninstall image-build image-push docker-build help
 
 help:
 	@echo "MaaS Controller make targets:"
@@ -46,8 +46,10 @@ uninstall:
 	kubectl delete -k config/default --ignore-not-found
 
 # Build container image (podman, buildah, or docker)
+# buildah uses "bud" (build-using-dockerfile) instead of "build"
+BUILD_CMD := $(if $(filter buildah,$(CONTAINER_RUNTIME)),bud,build)
 image-build:
-	$(CONTAINER_RUNTIME) build -t $(FULL_IMAGE) -f Containerfile .
+	$(CONTAINER_RUNTIME) $(BUILD_CMD) -t $(FULL_IMAGE) -f Containerfile .
 	@echo "Built $(FULL_IMAGE) with $(CONTAINER_RUNTIME)"
 
 # Alias for image-build (backward compatibility)

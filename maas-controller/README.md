@@ -34,10 +34,10 @@ Model Endpoint (200 OK)
 | You create | Controller generates | Per | Targets |
 |------------|---------------------|-----|---------|
 | **MaaSModel** | (validates HTTPRoute) | 1 per model | References LLMInferenceService |
-| **MaaSAuthPolicy** | Kuadrant **AuthPolicy** | 1 per (policy, model) pair | Model's HTTPRoute |
-| **MaaSSubscription** | Kuadrant **TokenRateLimitPolicy** | 1 per (subscription, model) pair | Model's HTTPRoute |
+| **MaaSAuthPolicy** | Kuadrant **AuthPolicy** | 1 per model (aggregated from all auth policies) | Model's HTTPRoute |
+| **MaaSSubscription** | Kuadrant **TokenRateLimitPolicy** | 1 per model (aggregated from all subscriptions) | Model's HTTPRoute |
 
-A MaaSAuthPolicy can reference multiple models, and multiple MaaSAuthPolicies can reference the same model (many-to-many). Same for MaaSSubscription.
+Relationships are many-to-many: multiple MaaSAuthPolicies/MaaSSubscriptions can reference the same model — the controller aggregates them into a single Kuadrant policy per model. Multiple subscriptions for one model use mutually exclusive predicates with priority based on token limit (highest wins).
 
 ### Controller watches
 
@@ -50,9 +50,23 @@ The controller watches these resources and re-reconciles automatically:
 | Generated AuthPolicy changes | Parent MaaSAuthPolicy | Overwrite manual edits (unless opted out) |
 | Generated TokenRateLimitPolicy changes | Parent MaaSSubscription | Overwrite manual edits (unless opted out) |
 
-### Lifecycle: MaaSModel deletion
+### Lifecycle: Deletion behavior
 
-When a MaaSModel is deleted, the controller uses a finalizer to cascade-delete all generated AuthPolicies and TokenRateLimitPolicies for that model. The parent MaaSAuthPolicy and MaaSSubscription remain intact. The underlying LLMInferenceService is not affected.
+**MaaSModel deleted:** The controller uses a finalizer to cascade-delete all generated AuthPolicies and TokenRateLimitPolicies for that model. The parent MaaSAuthPolicy and MaaSSubscription CRs remain intact. The underlying LLMInferenceService is not affected.
+
+**MaaSSubscription deleted:** The aggregated TRLP for the model is deleted, then rebuilt from the remaining subscriptions. If no subscriptions remain, the model falls back to the gateway-default-deny (429 for everyone).
+
+**MaaSAuthPolicy deleted:** Same pattern — the aggregated AuthPolicy is rebuilt from remaining auth policies.
+
+### Multi-subscription priority
+
+When multiple subscriptions target the same model, the controller sorts them by token limit (highest first) and builds mutually exclusive predicates. A user matching multiple subscription groups hits only the highest-limit rule:
+
+```
+premium-user (50000 tkn/min): matches "in premium-user"
+free-user    (100 tkn/min):   matches "in free-user AND NOT in premium-user"
+deny-unsubscribed (0):        matches "NOT in premium-user AND NOT in free-user"
+```
 
 ## Prerequisites
 
@@ -91,37 +105,47 @@ Common groups: `dedicated-admins`, `system:authenticated`, `system:authenticated
 
 All commands below are meant to be run from the **repository root** (the directory containing `maas-controller/`).
 
-1. Deploy the base MaaS infrastructure first:
+### Option A: Full deploy with subscription controller (recommended)
+
+Deploy the entire MaaS stack including the subscription controller in one command:
+
+```bash
+./scripts/deploy.sh -t odh --enable-subscriptions
+```
+
+This installs all infrastructure (cert-manager, LWS, Kuadrant, ODH, gateway, policies)
+plus the subscription controller. It also disables the old gateway-auth-policy automatically.
+
+### Option B: Add subscription controller to an existing deployment
+
+If MaaS infrastructure is already deployed, install just the controller:
+
+1. Disable the shared gateway-auth-policy (so the controller can manage auth per HTTPRoute):
 
    ```bash
-   ./scripts/deploy-rhoai-stable.sh -t odh
+   NAMESPACE=opendatahub ./maas-controller/hack/disable-gateway-auth-policy.sh
    ```
 
-2. Disable the shared gateway-auth-policy (so the controller can manage auth per HTTPRoute):
+   The policy may be in `opendatahub` or `openshift-ingress` depending on deployment.
+
+2. Install the controller (CRDs + RBAC + deployment + default deny policy):
 
    ```bash
-   # The policy may be in opendatahub or openshift-ingress depending on deployment
-   NAMESPACE=opendatahub maas-controller/hack/disable-gateway-auth-policy.sh
-   ```
-
-3. Install the controller (CRDs + RBAC + deployment + default deny policy):
-
-   ```bash
-   maas-controller/scripts/install-maas-controller.sh
+   ./maas-controller/scripts/install-maas-controller.sh
    ```
 
    To install into another namespace:
 
    ```bash
-   maas-controller/scripts/install-maas-controller.sh my-namespace
+   ./maas-controller/scripts/install-maas-controller.sh my-namespace
    ```
 
-4. Verify:
+### Verify
 
-   ```bash
-   kubectl get pods -n opendatahub -l app=maas-controller
-   kubectl get crd | grep maas.opendatahub.io
-   ```
+```bash
+kubectl get pods -n opendatahub -l app=maas-controller
+kubectl get crd | grep maas.opendatahub.io
+```
 
 ### What gets installed
 
