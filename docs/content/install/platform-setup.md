@@ -482,14 +482,6 @@ kind: Gateway
 metadata:
   name: maas-default-gateway
   namespace: openshift-ingress
-  annotations:
-    opendatahub.io/managed: "false"
-    security.opendatahub.io/authorino-tls-bootstrap: "true"
-  labels:
-    app.kubernetes.io/name: maas
-    app.kubernetes.io/instance: maas-default-gateway
-    app.kubernetes.io/component: gateway
-    opendatahub.io/managed: "false"
 spec:
   gatewayClassName: openshift-default
   listeners:
@@ -515,12 +507,6 @@ spec:
        mode: Terminate
 EOF
 ```
-
-!!! info "Gateway Annotations"
-    - `security.opendatahub.io/authorino-tls-bootstrap: "true"` - Enables automatic TLS configuration between the Gateway and Authorino for secure authentication
-    - `opendatahub.io/managed: "false"` - Prevents the operator from managing AuthPolicy automatically (since we're using custom policies)
-
-    For more details on TLS configuration, see the [TLS Configuration Guide](../configuration-and-management/tls-configuration.md).
 
 Wait for the Gateway to be programmed:
 
