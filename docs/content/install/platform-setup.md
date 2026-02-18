@@ -302,10 +302,24 @@ spec:
     allowedRoutes:
       namespaces:
         from: All
+  - name: https
+    port: 443
+    protocol: HTTPS
+    tls:
+      mode: Terminate
+      certificateRefs:
+      - name: <your-tls-cert-secret>
+        kind: Secret
+    allowedRoutes:
+      namespaces:
+        from: All
   infrastructure:
     labels:
       serving.kserve.io/gateway: kserve-ingress-gateway
 ```
+
+!!! info "TLS Certificate"
+    Replace `<your-tls-cert-secret>` with your TLS certificate secret name. Common OpenShift certificate secrets include `default-gateway-cert`, `data-science-gatewayconfig-tls`, or `data-science-gateway-service-tls`. The certificate secret must exist in the `openshift-ingress` namespace.
 
 !!! info "Gateway Architecture"
     MaaS uses a segregated gateway approach where models explicitly opt-in to MaaS capabilities. The `openshift-ai-inference` gateway above is for standard KServe inference, while `maas-default-gateway` (created later) enables token authentication and rate limiting. For details, see [Model Setup - Gateway Architecture](../configuration-and-management/model-setup.md#gateway-architecture).
@@ -446,12 +460,36 @@ below provides an example Gateway you can use:
 # Get your cluster's domain
 CLUSTER_DOMAIN=$(kubectl get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}')
 
+# Detect TLS certificate secret (or set manually)
+CERT_NAME=$(kubectl get ingresscontroller default -n openshift-ingress-operator \
+  -o jsonpath='{.spec.defaultCertificate.name}' 2>/dev/null)
+
+# If not found, check common certificate names
+if [[ -z "$CERT_NAME" ]]; then
+  for cert in default-gateway-cert data-science-gatewayconfig-tls data-science-gateway-service-tls; do
+    if kubectl get secret -n openshift-ingress "$cert" &>/dev/null; then
+      CERT_NAME="$cert"
+      break
+    fi
+  done
+fi
+
+echo "Using TLS certificate: ${CERT_NAME}"
+
 kubectl apply -f - <<EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: maas-default-gateway
   namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+  labels:
+    app.kubernetes.io/name: maas
+    app.kubernetes.io/instance: maas-default-gateway
+    app.kubernetes.io/component: gateway
+    opendatahub.io/managed: "false"
 spec:
   gatewayClassName: openshift-default
   listeners:
@@ -462,8 +500,27 @@ spec:
      allowedRoutes:
        namespaces:
          from: All
+   - name: https
+     hostname: maas.${CLUSTER_DOMAIN}
+     port: 443
+     protocol: HTTPS
+     allowedRoutes:
+       namespaces:
+         from: All
+     tls:
+       certificateRefs:
+       - group: ''
+         kind: Secret
+         name: ${CERT_NAME}
+       mode: Terminate
 EOF
 ```
+
+!!! info "Gateway Annotations"
+    - `security.opendatahub.io/authorino-tls-bootstrap: "true"` - Enables automatic TLS configuration between the Gateway and Authorino for secure authentication
+    - `opendatahub.io/managed: "false"` - Prevents the operator from managing AuthPolicy automatically (since we're using custom policies)
+
+    For more details on TLS configuration, see the [TLS Configuration Guide](../configuration-and-management/tls-configuration.md).
 
 Wait for the Gateway to be programmed:
 
