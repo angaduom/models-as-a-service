@@ -448,7 +448,7 @@ else
         if [ "$API_KEY_HTTP_CODE" = "201" ]; then
             TOKEN=$(echo "$API_KEY_BODY" | jq -r '.key // empty' 2>/dev/null)
             API_KEY_ID=$(echo "$API_KEY_BODY" | jq -r '.id // empty' 2>/dev/null)
-            if [ -n "$TOKEN" ] && [ -n "$API_KEY_ID" ]; then
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] && [ -n "$API_KEY_ID" ] && [ "$API_KEY_ID" != "null" ]; then
                 print_success "MaaS API key created (name: $API_KEY_NAME)"
                 # Set up cleanup trap to delete the API key on exit
                 cleanup_api_key() {
@@ -483,7 +483,7 @@ else
             fi
         else
             print_fail "Failed to create MaaS API key (HTTP $API_KEY_HTTP_CODE)" \
-                "Response: $(echo $API_KEY_BODY | head -c 200)" \
+                "Response: $(echo "$API_KEY_BODY" | head -c 200)" \
                 "Check MaaS API key endpoint: ${HOST}/maas-api/v1/api-keys"
             TOKEN=""
         fi
