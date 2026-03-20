@@ -414,18 +414,61 @@ else
     print_info "Using gateway endpoint: $HOST"
     
     # Get authentication token for API tests
-    # Use pre-existing token from CI/test environment, or fall back to oc whoami -t
+    # First obtain the OC identity token, then create a MaaS API key for subsequent calls
     print_check "Authentication token"
+    OC_TOKEN=""
+    TOKEN=""
+    API_KEY_ID=""
     if command -v oc &> /dev/null; then
-        TOKEN="${TOKEN:-${ADMIN_OC_TOKEN:-$(oc whoami -t 2>/dev/null || echo "")}}"
-        if [ -n "$TOKEN" ]; then
-            print_success "Authentication token available"
+        OC_TOKEN="${ADMIN_OC_TOKEN:-$(oc whoami -t 2>/dev/null || echo "")}"
+        if [ -n "$OC_TOKEN" ]; then
+            print_success "OpenShift identity token available"
         else
             print_warning "Cannot get OpenShift token" "Not logged into oc CLI" "Run: oc login"
         fi
     else
         print_warning "oc CLI not found" "Cannot test authentication" "Install oc CLI or use kubectl with token"
-        TOKEN=""
+    fi
+
+    # Create a MaaS API key using the OC token
+    if [ -n "$OC_TOKEN" ]; then
+        print_check "MaaS API key creation"
+        API_KEY_NAME="validate-test-$(date +%s)"
+        API_KEY_RESPONSE=$(curl -sSk --connect-timeout 10 --max-time 30 \
+            -H "Authorization: Bearer $OC_TOKEN" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d "{\"expiresIn\": \"1h\", \"name\": \"$API_KEY_NAME\"}" \
+            -w "\n%{http_code}" \
+            "${HOST}/maas-api/v1/api-keys" 2>/dev/null || echo "")
+        API_KEY_HTTP_CODE=$(echo "$API_KEY_RESPONSE" | tail -n1)
+        API_KEY_BODY=$(echo "$API_KEY_RESPONSE" | sed '$d')
+
+        if [ "$API_KEY_HTTP_CODE" = "201" ]; then
+            TOKEN=$(echo "$API_KEY_BODY" | jq -r '.key' 2>/dev/null)
+            API_KEY_ID=$(echo "$API_KEY_BODY" | jq -r '.id' 2>/dev/null)
+            if [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]; then
+                print_success "MaaS API key created (name: $API_KEY_NAME)"
+                # Set up cleanup trap to delete the API key on exit
+                cleanup_api_key() {
+                    if [ -n "${API_KEY_ID:-}" ] && [ "${API_KEY_ID}" != "null" ]; then
+                        curl -sSk -o /dev/null \
+                            -H "Authorization: Bearer $OC_TOKEN" \
+                            -X DELETE \
+                            "${HOST}/maas-api/v1/api-keys/${API_KEY_ID}" 2>/dev/null || true
+                    fi
+                }
+                trap cleanup_api_key EXIT INT TERM
+            else
+                print_fail "Failed to parse API key from response" "Response: $(echo $API_KEY_BODY | head -c 200)"
+                TOKEN=""
+            fi
+        else
+            print_fail "Failed to create MaaS API key (HTTP $API_KEY_HTTP_CODE)" \
+                "Response: $(echo $API_KEY_BODY | head -c 200)" \
+                "Check MaaS API key endpoint: ${HOST}/maas-api/v1/api-keys"
+            TOKEN=""
+        fi
     fi
     
     # Test models endpoint
