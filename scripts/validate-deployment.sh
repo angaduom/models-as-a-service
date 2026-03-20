@@ -416,7 +416,6 @@ else
     # Get authentication token for API tests
     # First obtain the OC identity token, then create a MaaS API key for subsequent calls
     print_check "Authentication token"
-    OC_TOKEN=""
     TOKEN=""
     API_KEY_ID=""
     OC_TOKEN="${ADMIN_OC_TOKEN:-}"
@@ -447,8 +446,8 @@ else
         API_KEY_BODY=$(echo "$API_KEY_RESPONSE" | sed '$d')
 
         if [ "$API_KEY_HTTP_CODE" = "201" ]; then
-            TOKEN=$(printf '%s' "$API_KEY_BODY" | jq -r '.key // empty' 2>/dev/null)
-            API_KEY_ID=$(printf '%s' "$API_KEY_BODY" | jq -r '.id // empty' 2>/dev/null)
+            TOKEN=$(echo "$API_KEY_BODY" | jq -r '.key // empty' 2>/dev/null)
+            API_KEY_ID=$(echo "$API_KEY_BODY" | jq -r '.id // empty' 2>/dev/null)
             if [ -n "$TOKEN" ] && [ -n "$API_KEY_ID" ]; then
                 print_success "MaaS API key created (name: $API_KEY_NAME)"
                 # Set up cleanup trap to delete the API key on exit
